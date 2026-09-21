@@ -1,0 +1,9 @@
+bin/
+*.o
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+results/ncu/*.ncu-rep
+results/ncu/*.log
+results/ptxas_raw.txt
+sgemm_results.zip
