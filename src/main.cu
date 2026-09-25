@@ -4,6 +4,7 @@
 
 #include "runner.cuh"
 
+const float TOLERANCE = 1e-2f;
 const unsigned int SEED_A = 1234;
 const unsigned int SEED_B = 5678;
 
@@ -88,6 +89,7 @@ int main(int argc, char** argv) {
     printf("\n%-3s %-20s %6s %11s %10s %10s %12s\n",
            "id", "kernel", "size", "median_ms", "GFLOPS", "% cuBLAS", "max_abs_err");
 
+    bool allPassed = true;
     for (int size : options.sizes) {
         if (size % 128 != 0) {
             fprintf(stderr, "Size %d is not a multiple of 128; the kernels assume it is.\n", size);
@@ -101,12 +103,18 @@ int main(int argc, char** argv) {
         fillRandom(hostA, SEED_A);
         fillRandom(hostB, SEED_B);
 
-        float *deviceA, *deviceB, *deviceC;
+        float *deviceA, *deviceB, *deviceC, *deviceReference;
         CUDA_CHECK(cudaMalloc(&deviceA, bytes));
         CUDA_CHECK(cudaMalloc(&deviceB, bytes));
         CUDA_CHECK(cudaMalloc(&deviceC, bytes));
+        CUDA_CHECK(cudaMalloc(&deviceReference, bytes));
         CUDA_CHECK(cudaMemcpy(deviceA, hostA.data(), bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(deviceB, hostB.data(), bytes, cudaMemcpyHostToDevice));
+
+        runCublas(handle, M, N, K, alpha, deviceA, deviceB, beta, deviceReference);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> reference(size * size), result(size * size);
+        CUDA_CHECK(cudaMemcpy(reference.data(), deviceReference, bytes, cudaMemcpyDeviceToHost));
 
         float cublasMs = timeKernelMs([&]() {
             runCublas(handle, M, N, K, alpha, deviceA, deviceB, beta, deviceC);
@@ -120,16 +128,39 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            printf("%-3d %-20s  not implemented yet\n", kernel, kernelName(kernel));
+            runKernel(kernel, handle, M, N, K, alpha, deviceA, deviceB, beta, deviceC);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(result.data(), deviceC, bytes, cudaMemcpyDeviceToHost));
+            float error = maxAbsError(result, reference);
+
+            if (error > TOLERANCE) {
+                printf("%-3d %-20s %6d  FAILED: max abs error %.3e > %.0e\n",
+                       kernel, kernelName(kernel), size, error, TOLERANCE);
+                allPassed = false;
+                continue;
+            }
+
+            float ms = timeKernelMs([&]() {
+                runKernel(kernel, handle, M, N, K, alpha, deviceA, deviceB, beta, deviceC);
+            });
+            double value = gflops(M, N, K, ms);
+            double pct = 100.0 * value / cublasGflops;
+            printRow(kernel, kernelName(kernel), size, ms, value, pct, error);
+            writeRow(csv, kernel, kernelName(kernel), size, ms, value, pct, error);
         }
 
         CUDA_CHECK(cudaFree(deviceA));
         CUDA_CHECK(cudaFree(deviceB));
         CUDA_CHECK(cudaFree(deviceC));
+        CUDA_CHECK(cudaFree(deviceReference));
     }
 
     if (csv != nullptr) fclose(csv);
     CUBLAS_CHECK(cublasDestroy(handle));
 
+    if (!allPassed) {
+        fprintf(stderr, "\nOne or more kernels FAILED the correctness check.\n");
+        return EXIT_FAILURE;
+    }
     return EXIT_SUCCESS;
 }
