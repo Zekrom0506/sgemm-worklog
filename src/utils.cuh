@@ -46,6 +46,10 @@ inline float maxAbsError(const std::vector<float>& result,
     float maxError = 0.0f;
     for (size_t i = 0; i < result.size(); i++) {
         float error = std::fabs(result[i] - reference[i]);
+        // NaN never compares greater, so catch it explicitly.
+        if (std::isnan(result[i])) {
+            return INFINITY;
+        }
         maxError = std::max(maxError, error);
     }
     return maxError;

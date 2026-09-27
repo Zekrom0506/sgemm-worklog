@@ -111,11 +111,15 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(deviceA, hostA.data(), bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(deviceB, hostB.data(), bytes, cudaMemcpyHostToDevice));
 
+        // With beta = 0 the kernels still read C, and 0 * NaN = NaN, so C must
+        // never hold uninitialised memory.
+        CUDA_CHECK(cudaMemset(deviceReference, 0, bytes));
         runCublas(handle, M, N, K, alpha, deviceA, deviceB, beta, deviceReference);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<float> reference(size * size), result(size * size);
         CUDA_CHECK(cudaMemcpy(reference.data(), deviceReference, bytes, cudaMemcpyDeviceToHost));
 
+        CUDA_CHECK(cudaMemset(deviceC, 0, bytes));
         float cublasMs = timeKernelMs([&]() {
             runCublas(handle, M, N, K, alpha, deviceA, deviceB, beta, deviceC);
         });
@@ -128,6 +132,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            CUDA_CHECK(cudaMemset(deviceC, 0, bytes));
             runKernel(kernel, handle, M, N, K, alpha, deviceA, deviceB, beta, deviceC);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaMemcpy(result.data(), deviceC, bytes, cudaMemcpyDeviceToHost));
