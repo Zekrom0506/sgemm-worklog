@@ -6,8 +6,9 @@
 #include "kernels/k3_shared_mem.cuh"
 #include "kernels/k4_1d_blocktiling.cuh"
 #include "kernels/k5_2d_blocktiling.cuh"
+#include "kernels/k6_vectorized.cuh"
 
-const int NUM_FP32_KERNELS = 5;
+const int NUM_FP32_KERNELS = 6;
 
 void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
                const float* A, const float* B, float beta, float* C) {
@@ -55,6 +56,14 @@ void run2DBlocktiling(int M, int N, int K, float alpha,
     sgemm_2d_blocktiling<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
 }
 
+void runVectorized(int M, int N, int K, float alpha,
+                   const float* A, const float* B, float beta, float* C) {
+    const int BM = 128, BN = 128, TM = 8, TN = 8;
+    dim3 block((BM * BN) / (TM * TN));
+    dim3 grid(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    sgemm_vectorized<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+}
+
 const char* kernelName(int kernel) {
     switch (kernel) {
         case 0: return "cublas";
@@ -63,11 +72,12 @@ const char* kernelName(int kernel) {
         case 3: return "shared_mem";
         case 4: return "1d_blocktiling";
         case 5: return "2d_blocktiling";
+        case 6: return "vectorized";
         default: return "unknown";
     }
 }
 
-// Runs one of the FP32 kernels (0 = cuBLAS, 1-5 = ours).
+// Runs one of the FP32 kernels (0 = cuBLAS, 1-6 = ours).
 void runKernel(int kernel, cublasHandle_t handle, int M, int N, int K, float alpha,
                const float* A, const float* B, float beta, float* C) {
     switch (kernel) {
@@ -77,6 +87,7 @@ void runKernel(int kernel, cublasHandle_t handle, int M, int N, int K, float alp
         case 3: runSharedMem(M, N, K, alpha, A, B, beta, C); break;
         case 4: run1DBlocktiling(M, N, K, alpha, A, B, beta, C); break;
         case 5: run2DBlocktiling(M, N, K, alpha, A, B, beta, C); break;
+        case 6: runVectorized(M, N, K, alpha, A, B, beta, C); break;
         default:
             fprintf(stderr, "Unknown FP32 kernel %d\n", kernel);
             exit(EXIT_FAILURE);
