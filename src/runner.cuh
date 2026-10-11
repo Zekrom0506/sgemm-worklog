@@ -8,6 +8,7 @@
 #include "kernels/k5_2d_blocktiling.cuh"
 #include "kernels/k6_vectorized.cuh"
 #include "kernels/k7_autotuned.cuh"
+#include "kernels/k8_wmma_fp16.cuh"
 
 const int NUM_FP32_KERNELS = 7;
 
@@ -18,6 +19,15 @@ void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
     // and the column-major C^T it writes is exactly our row-major C.
     CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
                              &alpha, B, N, A, K, &beta, C, N));
+}
+
+void runCublasFp16(cublasHandle_t handle, int M, int N, int K, float alpha,
+                   const half* A, const half* B, float beta, float* C) {
+    // Same row-major trick as runCublas. FP16 inputs, FP32 compute and output.
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                              &alpha, B, CUDA_R_16F, N, A, CUDA_R_16F, K,
+                              &beta, C, CUDA_R_32F, N,
+                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 void runNaive(int M, int N, int K, float alpha,
@@ -156,6 +166,13 @@ void runAutotuned(int M, int N, int K, float alpha,
     config->launch(M, N, K, alpha, A, B, beta, C);
 }
 
+void runWmmaFp16(int M, int N, int K, float alpha,
+                 const half* A, const half* B, float beta, float* C) {
+    dim3 block(128);
+    dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 64));
+    sgemm_wmma_fp16<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+}
+
 const char* kernelName(int kernel) {
     switch (kernel) {
         case 0: return "cublas";
@@ -166,6 +183,7 @@ const char* kernelName(int kernel) {
         case 5: return "2d_blocktiling";
         case 6: return "vectorized";
         case 7: return "autotuned";
+        case 8: return "wmma_fp16";
         default: return "unknown";
     }
 }

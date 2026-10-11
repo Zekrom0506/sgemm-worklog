@@ -19,7 +19,7 @@ struct Options {
 void printUsage(const char* program) {
     printf("Usage: %s [--kernel N|all] [--size S | --sweep] [--csv path]\n", program);
     printf("       %s --autotune BM,BN,BK,TM,TN [--size S] [--csv path]\n", program);
-    printf("  kernels: 0 = cuBLAS, 1-7 = FP32 kernels\n");
+    printf("  kernels: 0 = cuBLAS, 1-7 = FP32 kernels, 8 = WMMA FP16 (vs cublasGemmEx)\n");
 }
 
 Options parseArgs(int argc, char** argv) {
@@ -30,7 +30,7 @@ Options parseArgs(int argc, char** argv) {
         if (arg == "--kernel" && hasValue) {
             std::string value = argv[++i];
             if (value == "all") {
-                for (int k = 0; k <= NUM_FP32_KERNELS; k++) {
+                for (int k = 0; k <= NUM_FP32_KERNELS + 1; k++) {
                     options.kernels.push_back(k);
                 }
             } else {
@@ -85,6 +85,68 @@ void writeRow(FILE* csv, int kernel, const char* name, int size, float ms,
     fprintf(csv, "%d,%s,%d,%.4f,%.2f,%.2f,%.3e\n",
             kernel, name, size, ms, gflopsValue, pctCublas, error);
     fflush(csv);
+}
+
+// Kernel 8 uses FP16 inputs, so it gets its own reference (cublasGemmEx with
+// the same types) rather than the FP32 cuBLAS result.
+bool benchmarkWmma(cublasHandle_t handle, int size, const std::vector<float>& hostA,
+                   const std::vector<float>& hostB, FILE* csv) {
+    int M = size, N = size, K = size;
+    float alpha = 1.0f, beta = 0.0f;
+
+    std::vector<half> hostAHalf(hostA.size());
+    std::vector<half> hostBHalf(hostB.size());
+    for (size_t i = 0; i < hostA.size(); i++) hostAHalf[i] = __float2half(hostA[i]);
+    for (size_t i = 0; i < hostB.size(); i++) hostBHalf[i] = __float2half(hostB[i]);
+
+    half *deviceA, *deviceB;
+    float *deviceC, *deviceReference;
+    size_t bytesHalf = (size_t)size * size * sizeof(half);
+    size_t bytesFloat = (size_t)size * size * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&deviceA, bytesHalf));
+    CUDA_CHECK(cudaMalloc(&deviceB, bytesHalf));
+    CUDA_CHECK(cudaMalloc(&deviceC, bytesFloat));
+    CUDA_CHECK(cudaMalloc(&deviceReference, bytesFloat));
+    CUDA_CHECK(cudaMemcpy(deviceA, hostAHalf.data(), bytesHalf, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(deviceB, hostBHalf.data(), bytesHalf, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(deviceC, 0, bytesFloat));
+    CUDA_CHECK(cudaMemset(deviceReference, 0, bytesFloat));
+
+    runCublasFp16(handle, M, N, K, alpha, deviceA, deviceB, beta, deviceReference);
+    runWmmaFp16(M, N, K, alpha, deviceA, deviceB, beta, deviceC);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> reference(size * size), result(size * size);
+    CUDA_CHECK(cudaMemcpy(reference.data(), deviceReference, bytesFloat, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(result.data(), deviceC, bytesFloat, cudaMemcpyDeviceToHost));
+    float error = maxAbsError(result, reference);
+
+    float cublasMs = timeKernelMs([&]() {
+        runCublasFp16(handle, M, N, K, alpha, deviceA, deviceB, beta, deviceReference);
+    });
+    double cublasGflops = gflops(M, N, K, cublasMs);
+    printRow(8, "cublas_fp16", size, cublasMs, cublasGflops, 100.0, 0.0f);
+    writeRow(csv, 8, "cublas_fp16", size, cublasMs, cublasGflops, 100.0, 0.0f);
+
+    bool passed = error <= TOLERANCE;
+    if (passed) {
+        float ms = timeKernelMs([&]() {
+            runWmmaFp16(M, N, K, alpha, deviceA, deviceB, beta, deviceC);
+        });
+        double value = gflops(M, N, K, ms);
+        printRow(8, kernelName(8), size, ms, value, 100.0 * value / cublasGflops, error);
+        writeRow(csv, 8, kernelName(8), size, ms, value, 100.0 * value / cublasGflops, error);
+    } else {
+        printf("8   %-20s %6d  FAILED: max abs error %.3e > %.0e\n",
+               kernelName(8), size, error, TOLERANCE);
+    }
+
+    CUDA_CHECK(cudaFree(deviceA));
+    CUDA_CHECK(cudaFree(deviceB));
+    CUDA_CHECK(cudaFree(deviceC));
+    CUDA_CHECK(cudaFree(deviceReference));
+    return passed;
 }
 
 int main(int argc, char** argv) {
@@ -181,6 +243,10 @@ int main(int argc, char** argv) {
             }
         } else {
             for (int kernel : options.kernels) {
+                if (kernel == 8) {
+                    allPassed &= benchmarkWmma(handle, size, hostA, hostB, csv);
+                    continue;
+                }
                 if (kernel == 0) {
                     printRow(0, kernelName(0), size, cublasMs, cublasGflops, 100.0, 0.0f);
                     writeRow(csv, 0, kernelName(0), size, cublasMs, cublasGflops, 100.0, 0.0f);
