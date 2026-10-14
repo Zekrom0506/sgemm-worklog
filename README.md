@@ -19,6 +19,9 @@ _Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python script
 3. [The kernels](#3-the-kernels) - [K1](#k1-naive) · [K2](#k2-global-memory-coalescing) · [K3](#k3-shared-memory-tiling) · [K4](#k4-1d-block-tiling) · [K5](#k5-2d-block-tiling) · [K6](#k6-vectorized-loads-and-a-transposed-a-tile) · [K7](#k7-autotuning-the-tile-sizes) · [K8](#k8-stretch-tensor-cores-with-wmma)
 4. [Profiler summary](#4-profiler-summary)
 5. [Roofline](#5-roofline)
+6. [What didn't work](#6-what-didnt-work)
+7. [The remaining gap to cuBLAS](#7-the-remaining-gap-to-cublas)
+8. [Interview Q&A](#8-interview-qa)
 
 ---
 
@@ -378,6 +381,60 @@ What to expect and look for:
 - **K2-K3** move to the right (fewer DRAM bytes per FLOP, thanks to coalescing and then shared-memory reuse) but stay far below the compute roof. Their limit is on-chip: L1/L2 transactions for K2 and the shared-memory pipe for K3, neither of which the DRAM roofline shows.
 - **K4-K7** have high enough intensity that DRAM is no longer the issue. They are compute-side kernels, and the remaining distance to the 8.1 TFLOPS roof is instruction overhead (address math, shared loads, syncs) and latency that occupancy cannot hide.
 - **cuBLAS** shows how close to the compute roof a production kernel gets on this card under sustained clocks. The T4 rarely holds its 1.59 GHz boost for long at 70 W, so even cuBLAS stays below the theoretical peak.
+
+---
+
+## 6. What didn't work
+
+**Small thread tiles (TM=TN=4).** The intuition "more threads = more parallelism" suggested that 128x128 tiles with 4x4 per thread (1024 threads) should beat 8x8 per thread (256 threads). It shouldn't, and the sweep checks it. A 4x4 outer product does 16 FMAs for 8 shared loads (2 FMA/load), versus 64 for 16 (4 FMA/load) at 8x8. That halves the compute-to-load ratio, which was the whole point of K5. More threads also means more threads repeating the same address math and the same `__syncthreads()`. The bottom of the autotune sweep:
+
+<!-- BEGIN:autotune_worst -->
+_Not measured yet: run `bash scripts/autotune.sh` on the GPU, then `python scripts/update_readme.py`._
+<!-- END:autotune_worst -->
+
+**Expecting K3 to be a big win.** Shared memory is "the" textbook optimization, but at one output per thread it only moves the bottleneck from DRAM to the shared-memory pipe (2 loads per FMA). The real gains only came once each thread computed many outputs from registers (K4, K5).
+
+**NaN results with beta = 0.** An early harness version did not zero C before the first launch. Uninitialised device memory sometimes holds NaN bit patterns, and `0.0f * NaN` is NaN, so a correct kernel could fail the check depending on what was left in that memory. The fix (`cudaMemset` of C before every correctness run) is in `main.cu`, and `maxAbsError` now treats NaN as an explicit failure instead of silently comparing false.
+
+---
+
+## 7. The remaining gap to cuBLAS
+
+Three well-known techniques are not implemented. **Warp tiling** adds a level between the block and the thread tile, so each warp works on a compact sub-tile; that improves register reuse and makes shared-memory access patterns conflict-free by construction. **Double buffering** uses two shared-memory buffers so the next tile's global loads overlap the current tile's FMAs instead of waiting behind a `__syncthreads()`. A related trick prefetches the next tile into registers. **Asynchronous copies** (`cp.async`, Ampere+) would let the copy bypass registers entirely, but they don't exist on Turing, so double buffering through registers is the T4 option. cuBLAS also chooses among many hand-tuned SASS kernels per shape, and that last few percent is hard to reach from CUDA C++.
+
+---
+
+## 8. Interview Q&A
+
+**Q1. Why did changing only the index mapping (K1 -> K2) speed things up so much?**
+Memory accesses are serviced per warp. In K1 the 32 threads of a warp read 32 different rows, so each load becomes ~32 separate 32-byte sectors. In K2 they read 32 consecutive floats, i.e. 4 sectors. Same FLOPs, same bytes of useful data, far fewer transactions. The measured ratio is the K2 speedup in the [results table](#sgemm-on-a-tesla-t4-from-naive-to-near-cublas-one-optimization-at-a-time).
+
+**Q2. Why are there two `__syncthreads()` in the tiled loop?**
+The first makes sure the whole tile is in shared memory before any thread reads elements loaded by other threads. The second makes sure no thread starts overwriting the tile with the next K-step's data while slower warps are still reading the current one. Remove either and you get a race that may pass small tests and fail large ones.
+
+**Q3. Shared memory is ~100x faster than DRAM. Why was K3 only a modest win?**
+Because its inner loop does 2 shared-memory loads per FMA, so it becomes bound by shared-memory bandwidth and load-issue slots. The win comes when each thread reuses values from registers (K4: 8 FMAs / 9 loads, K5: 64 FMAs / 16 loads).
+
+**Q4. Explain 2D block tiling as an outer product.**
+For each k, a thread loads 8 values of A's column k (its rows) and 8 values of B's row k (its columns) into registers, then updates its 8x8 accumulator with every pair, rank-1 update `C += a (x) b`. Loads grow linearly (8+8) while FMAs grow quadratically (8x8), so bigger thread tiles raise arithmetic intensity until registers run out.
+
+**Q5. What is a shared memory bank conflict and how did you reduce one?**
+Shared memory is 32 banks of 4 bytes. If threads of a warp access different addresses in the same bank, the access is replayed. In K5 the A operand for the two `threadRow`s in a warp was 64 floats apart (same bank), giving a 2-way conflict. Storing the A tile transposed (`As[k][row]`) made each thread's 8 A values contiguous: different banks, and vectorizable to `LDS.128`. I checked it with `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` (see the profiler table).
+
+**Q6. Is higher occupancy always better?**
+No. K5-K7 run at lower occupancy than K2 because each thread holds ~100 registers, but they are much faster: instruction-level parallelism inside a thread (64 independent FMAs per k) hides latency instead of warp switching. Occupancy matters only until there is enough independent work to cover latency.
+
+**Q7. Why do the tile sizes have to be template parameters?**
+They size `__shared__` arrays and the per-thread register arrays (`threadResults[TM*TN]`). A register array is only kept in registers if every index is known at compile time after unrolling. With runtime sizes it would spill to local memory, which is DRAM-backed. That is why K7 is the one templated kernel and why `-Xptxas -v` (zero spill bytes) is the check.
+
+**Q8. How do you call column-major cuBLAS for row-major matrices without transposing anything?**
+A row-major matrix read as column-major is its transpose. So I ask cuBLAS for `C^T = B^T A^T`: pass B first, A second, swap M and N, leading dimensions N, K, N. The column-major `C^T` it writes is exactly the row-major C.
+
+**Q9. Why report the median of 20 runs instead of the mean or the best?**
+The T4 is a 70 W card that power- and thermally-throttles under sustained load, so individual runs vary by a few percent. The median ignores outliers in both directions. The best run would overstate sustained performance, and the mean is skewed by occasional slow runs.
+
+**Q10. Your K8 tensor-core kernel is faster than every FP32 kernel. Why isn't it in the main table?**
+It solves a different problem: inputs are rounded to FP16 (11-bit mantissa) before multiplying. It is compared only against `cublasGemmEx` with identical types. Putting it next to SGEMM would be comparing different precisions.
 
 ---
 
