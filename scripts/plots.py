@@ -236,7 +236,7 @@ def plot_autotune_heatmap():
     grid = grid.reindex(index=[64, 128], columns=[64, 128])
 
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
-    image = ax.imshow(grid.values, cmap="Blues", vmin=0)
+    image = ax.imshow(grid.values, cmap="Blues")
     ax.grid(False)
     ax.set_xticks(range(len(grid.columns)))
     ax.set_xticklabels(grid.columns)
@@ -244,12 +244,13 @@ def plot_autotune_heatmap():
     ax.set_yticklabels(grid.index)
     ax.set_xlabel("BN")
     ax.set_ylabel("BM")
-    vmax = pd.Series(grid.values.ravel()).max()
+    values = pd.Series(grid.values.ravel()).dropna()
+    midpoint = (values.min() + values.max()) / 2
     for i in range(grid.shape[0]):
         for j in range(grid.shape[1]):
             value = grid.values[i, j]
             text = "n/a" if pd.isna(value) else f"{value:.0f}"
-            dark_cell = not pd.isna(value) and value > 0.6 * vmax
+            dark_cell = not pd.isna(value) and value > midpoint
             ax.text(j, i, text, ha="center", va="center",
                     color="white" if dark_cell else TEXT_COLOR)
     fig.colorbar(image, ax=ax, label="GFLOPS")
