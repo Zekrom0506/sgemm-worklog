@@ -12,7 +12,7 @@ This repo is a worklog of writing FP32 matrix multiplication, `C = alpha*A*B + b
 | K4 1D block tiling | 1767 | 41.2% | 2.08x |
 | K5 2D block tiling | 3023 | 70.4% | 1.71x |
 | K6 vectorized + transposed A | 3379 | 78.7% | 1.12x |
-| K7 autotuned | 3380 | 78.7% | 1.00x |
+| K7 autotuned | 3797 | 87.5% | 1.12x |
 <!-- END:results_table -->
 
 ![GFLOPS at 4096](plots/bar_4096.png)
@@ -90,7 +90,7 @@ One detail worth knowing: with `beta = 0` the kernels still read C, and `0 * NaN
 | K4 1D block tiling | 120 | 538 | 1949 | 2009 | 1913 | 1767 |
 | K5 2D block tiling | 51 | 238 | 1928 | 3192 | 3300 | 3023 |
 | K6 vectorized + transposed A | 65 | 282 | 2156 | 3690 | 3763 | 3379 |
-| K7 autotuned | 65 | 263 | 2126 | 3697 | 3725 | 3380 |
+| K7 autotuned | 74 | 331 | 1372 | 2542 | 3961 | 3797 |
 
 Largest max-abs-error against cuBLAS across all kernels and sizes: 1.60e-04 (tolerance 1e-2).
 <!-- END:sweep_table -->
@@ -346,7 +346,7 @@ Fastest configurations:
 ![autotune heatmap](plots/autotune_heatmap.png)
 
 <!-- BEGIN:k7_result -->
-**Measured at 4096:** 3380 GFLOPS, 78.7% of cuBLAS, 1.00x over K6 (median of 20 runs, 40.67 ms).
+**Measured at 4096:** 3797 GFLOPS, 87.5% of cuBLAS, 1.12x over K6 (median of 20 runs, 36.19 ms).
 <!-- END:k7_result -->
 
 **The trade-off.** Bigger tiles mean more reuse. A BMxBN block tile loads (BM+BN)xBK floats per K-step to do BMxBNxBK FMAs, and a TMxTN thread tile does TMxTN FMAs per TM+TN shared loads. But both cost resources:
