@@ -142,7 +142,7 @@ const TileConfig AUTOTUNE_CONFIGS[] = {
 const int NUM_AUTOTUNE_CONFIGS = sizeof(AUTOTUNE_CONFIGS) / sizeof(AUTOTUNE_CONFIGS[0]);
 
 // The official kernel 7. Set this to the fastest row of results/autotune.csv.
-const int K7_BM = 128, K7_BN = 128, K7_BK = 8, K7_TM = 8, K7_TN = 8;
+const int K7_BM = 128, K7_BN = 128, K7_BK = 32, K7_TM = 8, K7_TN = 4;
 
 const TileConfig* findTileConfig(int BM, int BN, int BK, int TM, int TN) {
     for (int i = 0; i < NUM_AUTOTUNE_CONFIGS; i++) {

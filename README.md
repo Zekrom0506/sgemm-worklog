@@ -95,6 +95,8 @@ One detail worth knowing: with `beta = 0` the kernels still read C, and `0 * NaN
 Largest max-abs-error against cuBLAS across all kernels and sizes: 1.60e-04 (tolerance 1e-2).
 <!-- END:sweep_table -->
 
+Note that cuBLAS itself peaks at 1024 (6169 GFLOPS) and drops to 4294 GFLOPS at 4096. Each 4096 call takes ~32 ms, long enough for the 70 W T4 to heat up and clock down. The "% of cuBLAS" column at 4096 is therefore against a throttled cuBLAS, and the absolute GFLOPS are the more honest comparison. The autotune run measured its own cuBLAS, so its percentages differ slightly from this table.
+
 ![GFLOPS vs size](plots/gflops_vs_size.png)
 
 ---
@@ -299,7 +301,7 @@ As[aLoadCol * 4 + 1][aLoadRow] = aVec.y;
 float4 aValues = reinterpret_cast<const float4*>(&As[k][threadRow * TM + i])[0];  // LDS.128
 ```
 
-**Bank conflicts.** Shared memory has 32 banks, each 4 bytes wide; address `a` lives in bank `(a / 4) % 32`. A warp's shared-memory request is served in one pass if all threads hit different banks *or* the same address (broadcast). If `n` threads hit *different addresses in the same bank*, the request is replayed `n` times (an n-way conflict). In K5 a warp spans two values of `threadRow`. For the A reads the two addresses are `(threadRow*8 + i)*8 + k` and `((threadRow+1)*8 + i)*8 + k`, which are 64 floats apart: same bank, different address, so a 2-way conflict on every A load. In K6 the same two reads are 8 floats apart and land in different banks. The transpose *store* (`As[aLoadCol*4 + c][aLoadRow]`) is not free either: consecutive threads write with a stride of one row of `As`, so the store side is where to look for new conflicts. The ncu counters `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` / `_st.sum` for K5 vs K6 are in the [profiler table](#4-profiler-summary).
+**Bank conflicts.** Shared memory has 32 banks, each 4 bytes wide; address `a` lives in bank `(a / 4) % 32`. A warp's shared-memory request is served in one pass if all threads hit different banks *or* the same address (broadcast). If `n` threads hit *different addresses in the same bank*, the request is replayed `n` times (an n-way conflict). In K5 a warp spans two values of `threadRow`. For the A reads the two addresses are `(threadRow*8 + i)*8 + k` and `((threadRow+1)*8 + i)*8 + k`, which are 64 floats apart: same bank, different address, so a 2-way conflict on every A load. In K6 the same two reads are 8 floats apart and land in different banks. The transpose *store* (`As[aLoadCol*4 + c][aLoadRow]`) is not free either: consecutive threads write with a stride of one row of `As`, so the store side is where to look for new conflicts. **What ncu actually showed.** The transpose helped less than I expected. Shared-load bank conflicts at 4096 went from 301,989,888 (K5) to 268,435,456 (K6), only ~11% fewer, and the transposed store added 16,777,216 store conflicts (see the [profiler table](#4-profiler-summary)). Dividing by the work explains why. There are 8,192 warps x 4,096 inner-loop iterations, which works out to ~9 conflicts per iteration in K5 and 8 in K6, so A was never the main source. The conflicts come from the **B** reads. The 16 threads across a warp read `Bs[k][threadCol*8 .. +7]`, so their addresses are 8 floats apart and only 4 distinct groups of banks get used: a 4-way conflict on every B load, in K5 and K6 alike. The autotune sweep confirms this independently (see K7): with TM=8, configs with TN=4, where neighbouring threads' B reads are contiguous, beat TN=8 at every tile size.
 
 <!-- BEGIN:k6_result -->
 **Measured at 4096:** 3379 GFLOPS, 78.7% of cuBLAS, 1.12x over K5 (median of 20 runs, 40.67 ms).
@@ -334,6 +336,12 @@ Fastest configurations:
 
 35 valid configurations were measured at size 4096.
 <!-- END:autotune_best -->
+
+**What the sweep says.** The winner is BM=BN=128, BK=32, TM=8, TN=4 (512 threads) at 3325 GFLOPS. In the same run, K6's hand-picked 128x128x8 / 8x8 got 3179, so the tuned config is ~4.6% faster. Three patterns stand out in `results/autotune.csv`:
+
+- **TM=4 loses.** Every one of the 13 slowest configs has TM=4: a 4-row thread tile halves the FMA-per-shared-load ratio.
+- **With TM=8, TN=4 beats TN=8** at every tile size (e.g. 128x128x32: 3325 vs 3137 GFLOPS; 64x128x32: 2916 vs 2700). With TN=4 each thread reads 4 B values and neighbours read the next 4, so a warp's B reads are contiguous and avoid the 4-way bank conflict described in K6.
+- **Big tiles win, and BK=32 helps them.** Fewer, longer K-steps mean fewer `__syncthreads()` per FLOP. The winner uses 64 registers per thread (`resource_usage.txt`), so exactly two 512-thread blocks fill the T4's 64K-register file and 1024-thread limit, and 2 x 32 KB of shared memory fits in 64 KB.
 
 ![autotune heatmap](plots/autotune_heatmap.png)
 
@@ -480,7 +488,7 @@ The roofline plots each kernel's achieved GFLOPS against its arithmetic intensit
 What to expect and look for:
 
 - **K1** reads far more DRAM bytes than the 192 MB minimum, and its warps are mostly waiting on memory transactions, not DRAM *bandwidth*. It sits well below *both* roofs, which is the signature of a latency/transaction-bound kernel rather than a bandwidth-bound one.
-- **K2-K3** move to the right (fewer DRAM bytes per FLOP, thanks to coalescing and then shared-memory reuse) but stay far below the compute roof. Their limit is on-chip: L1/L2 transactions for K2 and the shared-memory pipe for K3, neither of which the DRAM roofline shows.
+- **K2 sits at almost the same intensity as K1.** ncu shows practically the same DRAM traffic (17,646 MB vs 17,764 MB read), because L2 was already absorbing K1's scattered reads. The 8.5x speed-up came from fewer L1 / load-store transactions, not fewer DRAM bytes. K1's top stall reason is `lg_throttle` (the global load/store queue is full) at 436.7 cycles per instruction, versus 23.8 for K2. **K3** cuts DRAM reads to 13,178 MB, and its top stall becomes `mio_throttle`: waiting on the shared-memory pipe, exactly the bottleneck predicted in the K3 section.
 - **K4-K7** have high enough intensity that DRAM is no longer the issue. They are compute-side kernels, and the remaining distance to the 8.1 TFLOPS roof is instruction overhead (address math, shared loads, syncs) and latency that occupancy cannot hide.
 - **cuBLAS** shows how close to the compute roof a production kernel gets on this card under sustained clocks. The T4 rarely holds its 1.59 GHz boost for long at 70 W, so even cuBLAS stays below the theoretical peak.
 
@@ -488,7 +496,7 @@ What to expect and look for:
 
 ## 6. What didn't work
 
-**Small thread tiles (TM=TN=4).** The intuition "more threads = more parallelism" suggested that 128x128 tiles with 4x4 per thread (1024 threads) should beat 8x8 per thread (256 threads). It shouldn't, and the sweep checks it. A 4x4 outer product does 16 FMAs for 8 shared loads (2 FMA/load), versus 64 for 16 (4 FMA/load) at 8x8. That halves the compute-to-load ratio, which was the whole point of K5. More threads also means more threads repeating the same address math and the same `__syncthreads()`. The bottom of the autotune sweep:
+**Small thread tiles.** I expected 128x128 tiles with 4x4 per thread (1024 threads) to be competitive: more threads, more parallelism. It came 14th of 35 (2723 GFLOPS vs 3325 for the winner), and every one of the 13 slowest configs has TM=4. A 4x4 outer product does 16 FMAs for 8 shared loads (2 FMA/load), versus 64 for 16 (4 FMA/load) at 8x8. That halves the compute-to-load ratio, which was the whole point of K5. The very worst combine TM=4 with TN=8, which also has the B-read bank conflict. The bottom of the sweep:
 
 <!-- BEGIN:autotune_worst -->
 | BM | BN | BK | TM | TN | threads | GFLOPS | % cuBLAS |
@@ -499,6 +507,8 @@ What to expect and look for:
 <!-- END:autotune_worst -->
 
 **Expecting K3 to be a big win.** Shared memory is "the" textbook optimization, but at one output per thread it only moves the bottleneck from DRAM to the shared-memory pipe (2 loads per FMA). The real gains only came once each thread computed many outputs from registers (K4, K5).
+
+**Transposing A to remove bank conflicts.** The K6 transpose was meant to fix shared-memory bank conflicts. ncu says load conflicts fell only ~11% (302M -> 268M), and the transposed store added 16.8M store conflicts, because most conflicts were on the B reads (see K6). K6 still beat K5 (3379 vs 3023 GFLOPS), but that came from issuing fewer, wider load instructions (float4 global loads, `LDS.128`), not from fewer conflicts. The change that actually removed the B conflict was found by the autotuner: TN=4.
 
 **NaN results with beta = 0.** An early harness version did not zero C before the first launch. Uninitialised device memory sometimes holds NaN bit patterns, and `0.0f * NaN` is NaN, so a correct kernel could fail the check depending on what was left in that memory. The fix (`cudaMemset` of C before every correctness run) is in `main.cu`, and `maxAbsError` now treats NaN as an explicit failure instead of silently comparing false.
 
@@ -524,8 +534,8 @@ Because its inner loop does 2 shared-memory loads per FMA, so it becomes bound b
 **Q4. Explain 2D block tiling as an outer product.**
 For each k, a thread loads 8 values of A's column k (its rows) and 8 values of B's row k (its columns) into registers, then updates its 8x8 accumulator with every pair, rank-1 update `C += a (x) b`. Loads grow linearly (8+8) while FMAs grow quadratically (8x8), so bigger thread tiles raise arithmetic intensity until registers run out.
 
-**Q5. What is a shared memory bank conflict and how did you reduce one?**
-Shared memory is 32 banks of 4 bytes. If threads of a warp access different addresses in the same bank, the access is replayed. In K5 the A operand for the two `threadRow`s in a warp was 64 floats apart (same bank), giving a 2-way conflict. Storing the A tile transposed (`As[k][row]`) made each thread's 8 A values contiguous: different banks, and vectorizable to `LDS.128`. I checked it with `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` (see the profiler table).
+**Q5. What is a shared memory bank conflict and how did you deal with it?**
+Shared memory is 32 banks of 4 bytes. If threads in a warp access different addresses in the same bank, the access is replayed. I transposed the A tile in K6 expecting to remove a 2-way conflict on A reads, but ncu showed load conflicts only fell from 302M to 268M. The real source was the B reads: thread columns 8 floats apart use only 4 bank groups, a 4-way conflict. The autotune data confirmed it: with TM=8, TN=4 (contiguous B reads across threads) beats TN=8 at every tile size, and the best K7 config uses it. The lesson: measure the counter before and after instead of trusting the mental model.
 
 **Q6. Is higher occupancy always better?**
 No. K5-K7 run at lower occupancy than K2 because each thread holds ~100 registers, but they are much faster: instruction-level parallelism inside a thread (64 independent FMAs per k) hides latency instead of warp switching. Occupancy matters only until there is enough independent work to cover latency.
