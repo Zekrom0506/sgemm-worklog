@@ -12,7 +12,7 @@ This repo is a worklog of writing FP32 matrix multiplication, `C = alpha*A*B + b
 | K4 1D block tiling | 1767 | 41.2% | 2.08x |
 | K5 2D block tiling | 3023 | 70.4% | 1.71x |
 | K6 vectorized + transposed A | 3379 | 78.7% | 1.12x |
-| K7 autotuned | 3797 | 87.5% | 1.12x |
+| K7 autotuned | 3797 | 88.4% | 1.12x |
 <!-- END:results_table -->
 
 ![GFLOPS at 4096](plots/bar_4096.png)
@@ -346,7 +346,7 @@ Fastest configurations:
 ![autotune heatmap](plots/autotune_heatmap.png)
 
 <!-- BEGIN:k7_result -->
-**Measured at 4096:** 3797 GFLOPS, 87.5% of cuBLAS, 1.12x over K6 (median of 20 runs, 36.19 ms).
+**Measured at 4096:** 3797 GFLOPS, 88.4% of cuBLAS, 1.12x over K6 (median of 20 runs, 36.19 ms).
 <!-- END:k7_result -->
 
 **The trade-off.** Bigger tiles mean more reuse. A BMxBN block tile loads (BM+BN)xBK floats per K-step to do BMxBNxBK FMAs, and a TMxTN thread tile does TMxTN FMAs per TM+TN shared loads. But both cost resources:
@@ -509,6 +509,8 @@ What to expect and look for:
 **Expecting K3 to be a big win.** Shared memory is "the" textbook optimization, but at one output per thread it only moves the bottleneck from DRAM to the shared-memory pipe (2 loads per FMA). The real gains only came once each thread computed many outputs from registers (K4, K5).
 
 **Transposing A to remove bank conflicts.** The K6 transpose was meant to fix shared-memory bank conflicts. ncu says load conflicts fell only ~11% (302M -> 268M), and the transposed store added 16.8M store conflicts, because most conflicts were on the B reads (see K6). K6 still beat K5 (3379 vs 3023 GFLOPS), but that came from issuing fewer, wider load instructions (float4 global loads, `LDS.128`), not from fewer conflicts. The change that actually removed the B conflict was found by the autotuner: TN=4.
+
+**One tile size for every matrix size.** K7's config was tuned at 4096, and it pays off there and at 2048 (3961 vs 3763 GFLOPS for K6). At 512 and 1024 it is clearly *worse* than K6 (1372 vs 2156 and 2542 vs 3690 GFLOPS). With 128x128 tiles a 512 matrix is only 16 blocks, fewer than the T4's 40 SMs. With BK=32 each block also runs only K/32 loop iterations, each with a large load phase that nothing overlaps. Small problems want smaller tiles and more blocks. This is why cuBLAS chooses a different kernel per shape, and a real version of K7 would keep a small table of configs per size range.
 
 **NaN results with beta = 0.** An early harness version did not zero C before the first launch. Uninitialised device memory sometimes holds NaN bit patterns, and `0.0f * NaN` is NaN, so a correct kernel could fail the check depending on what was left in that memory. The fix (`cudaMemset` of C before every correctness run) is in `main.cu`, and `maxAbsError` now treats NaN as an explicit failure instead of silently comparing false.
 
