@@ -3,7 +3,16 @@
 This repo is a worklog of writing FP32 matrix multiplication, `C = alpha*A*B + beta*C` (row-major, square), in CUDA and making it fast on an NVIDIA T4. It goes through seven numbered kernels, each adding exactly one idea: coalescing, shared-memory tiling, 1D then 2D register blocking, vectorized loads with a transposed shared-memory layout, and finally an autotuned tile size. Every kernel is checked against cuBLAS for correctness and timed with CUDA events, and each step is explained with profiler evidence (Nsight Compute counters and `ptxas` resource reports) rather than intuition. A tensor-core (WMMA, FP16-in / FP32-accumulate) kernel is included as a separate, non-comparable stretch goal.
 
 <!-- BEGIN:results_table -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+| Kernel | GFLOPS @ 4096 | % of cuBLAS | Speedup vs previous |
+|---|---|---|---|
+| cuBLAS (reference) | 4293 | 100.0% |  |
+| K1 naive | 62 | 1.4% |  |
+| K2 global memory coalescing | 526 | 12.2% | 8.50x |
+| K3 shared memory tiling | 850 | 19.8% | 1.62x |
+| K4 1D block tiling | 1767 | 41.2% | 2.08x |
+| K5 2D block tiling | 3023 | 70.4% | 1.71x |
+| K6 vectorized + transposed A | 3379 | 78.7% | 1.12x |
+| K7 autotuned | 3380 | 78.7% | 1.00x |
 <!-- END:results_table -->
 
 ![GFLOPS at 4096](plots/bar_4096.png)
@@ -38,7 +47,7 @@ _Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python script
 | Max resident threads | 1024 per SM (32 warps) |
 
 <!-- BEGIN:device -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+Measured on: `Tesla T4 (sm_75), 40 SMs, 48 KB smem/block, CUDA runtime 13.0`
 <!-- END:device -->
 
 The T4 has no TF32 mode, so cuBLAS `Sgemm` here is a pure FP32 comparison. It is a 70 W card that power-throttles under sustained load, so expect run-to-run variation of a few percent. That is why the harness reports the **median** of 20 timed launches.
@@ -72,7 +81,18 @@ For each size the harness:
 One detail worth knowing: with `beta = 0` the kernels still read C, and `0 * NaN = NaN`. Freshly `cudaMalloc`ed memory can contain NaN bit patterns, so C is zeroed before every correctness run.
 
 <!-- BEGIN:sweep_table -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+| GFLOPS | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|---|---|
+| cuBLAS (reference) | 233 | 780 | 2521 | 6169 | 5778 | 4293 |
+| K1 naive | 24 | 26 | 30 | 61 | 62 | 62 |
+| K2 global memory coalescing | 151 | 352 | 803 | 680 | 573 | 526 |
+| K3 shared memory tiling | 199 | 432 | 1008 | 844 | 898 | 850 |
+| K4 1D block tiling | 120 | 538 | 1949 | 2009 | 1913 | 1767 |
+| K5 2D block tiling | 51 | 238 | 1928 | 3192 | 3300 | 3023 |
+| K6 vectorized + transposed A | 65 | 282 | 2156 | 3690 | 3763 | 3379 |
+| K7 autotuned | 65 | 263 | 2126 | 3697 | 3725 | 3380 |
+
+Largest max-abs-error against cuBLAS across all kernels and sizes: 1.60e-04 (tolerance 1e-2).
 <!-- END:sweep_table -->
 
 ![GFLOPS vs size](plots/gflops_vs_size.png)
@@ -132,7 +152,7 @@ for (int k = 0; k < K; k++) {
 ```
 
 <!-- BEGIN:k1_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 62 GFLOPS, 1.4% of cuBLAS (median of 20 runs, 2221.97 ms).
 <!-- END:k1_result -->
 
 **Why it's slow.** Every A load in a warp is spread over 32 rows, so each one becomes 32 separate memory transactions. Almost all of every 32-byte sector fetched is wasted. L1/L2 hide some of this because the next `k` hits the same lines, but the kernel is still limited by memory transactions, not arithmetic. ncu shows it in the [profiler table](#4-profiler-summary) as very low SM throughput.
@@ -156,7 +176,7 @@ warp w = threads 32w .. 32w+31  ->  row w of the tile, cols 0..31
 ```
 
 <!-- BEGIN:k2_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 526 GFLOPS, 12.2% of cuBLAS, 8.50x over K1 (median of 20 runs, 261.47 ms).
 <!-- END:k2_result -->
 
 **Why it matters.** A warp's memory instruction is serviced as a set of 32-byte sectors. After the change, a warp's B load touches 4 sectors instead of up to 32, so the same DRAM and L2 bandwidth delivers many more useful bytes. No arithmetic changed. This is the clearest demonstration in the project that on a GPU the access pattern of the *warp*, not the thread, is what counts.
@@ -186,7 +206,7 @@ __syncthreads();   // 2: nobody overwrites the tile while others still read it
 **The two `__syncthreads()`.** The first is needed because thread `t` reads `As[threadRow][k]` for all `k`, i.e. values written by 31 *other* threads. Without the barrier it could read before they have written. The second is needed because the loop wraps around and starts overwriting `As`/`Bs` with the next tile. A fast warp would otherwise clobber data that a slow warp is still using for the current tile.
 
 <!-- BEGIN:k3_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 850 GFLOPS, 19.8% of cuBLAS, 1.62x over K2 (median of 20 runs, 161.76 ms).
 <!-- END:k3_result -->
 
 **Why it helps less than you'd expect.** DRAM traffic falls by roughly the tile width, but look at the inner loop: every FMA needs **two shared-memory loads** (`As[threadRow][k]` and `Bs[k][threadCol]`). Shared memory is fast but not free. Its bandwidth per SM is a fixed number of bytes per cycle, and at 2 loads per FMA the load/store pipeline, not the FMA units, sets the speed. The bottleneck moved from DRAM to shared memory. The next two kernels attack the *loads per FMA* ratio.
@@ -222,7 +242,7 @@ for (int k = 0; k < BK; k++) {
 **Arithmetic intensity per thread.** Per `k` a thread now does 8 FMAs for 9 shared loads (1 B + 8 A), versus 1 FMA for 2 loads in K3. That is ~0.9 FMA/load vs 0.5. Global loads per block per K-step are (64+64)x8 floats for 64x64x8 FMAs, a 2x improvement over the 32x32 tile.
 
 <!-- BEGIN:k4_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 1767 GFLOPS, 41.2% of cuBLAS, 2.08x over K3 (median of 20 runs, 77.76 ms).
 <!-- END:k4_result -->
 
 ### K5: 2D block tiling
@@ -255,7 +275,7 @@ Each tile now has 128x8 = 1024 elements but there are only 256 threads, so each 
 **Why this is the big jump.** Per `k`, a thread does **64 FMAs for 16 shared loads** (4 FMA/load, vs 0.9 in K4 and 0.5 in K3). Per block per K-step, global traffic is (128+128)x8 floats for 128x128x8 FMAs, another 2x better than K4. The kernel finally spends most of its issue slots on FMAs. The cost is registers: 64 accumulators + 16 cached operands + addressing means ~100+ registers per thread (see the [resource table](#4-profiler-summary)), so occupancy falls. That trade is the theme of K7.
 
 <!-- BEGIN:k5_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 3023 GFLOPS, 70.4% of cuBLAS, 1.71x over K4 (median of 20 runs, 45.47 ms).
 <!-- END:k5_result -->
 
 ### K6: vectorized loads and a transposed A tile
@@ -282,7 +302,7 @@ float4 aValues = reinterpret_cast<const float4*>(&As[k][threadRow * TM + i])[0];
 **Bank conflicts.** Shared memory has 32 banks, each 4 bytes wide; address `a` lives in bank `(a / 4) % 32`. A warp's shared-memory request is served in one pass if all threads hit different banks *or* the same address (broadcast). If `n` threads hit *different addresses in the same bank*, the request is replayed `n` times (an n-way conflict). In K5 a warp spans two values of `threadRow`. For the A reads the two addresses are `(threadRow*8 + i)*8 + k` and `((threadRow+1)*8 + i)*8 + k`, which are 64 floats apart: same bank, different address, so a 2-way conflict on every A load. In K6 the same two reads are 8 floats apart and land in different banks. The transpose *store* (`As[aLoadCol*4 + c][aLoadRow]`) is not free either: consecutive threads write with a stride of one row of `As`, so the store side is where to look for new conflicts. The ncu counters `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` / `_st.sum` for K5 vs K6 are in the [profiler table](#4-profiler-summary).
 
 <!-- BEGIN:k6_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 3379 GFLOPS, 78.7% of cuBLAS, 1.12x over K5 (median of 20 runs, 40.67 ms).
 <!-- END:k6_result -->
 
 ### K7: autotuning the tile sizes
@@ -304,13 +324,21 @@ That leaves 35 of the 48 combinations. All 35 are instantiated into the one bina
 Fastest configurations:
 
 <!-- BEGIN:autotune_best -->
-_Not measured yet: run `bash scripts/autotune.sh` on the GPU, then `python scripts/update_readme.py`._
+| BM | BN | BK | TM | TN | threads | GFLOPS | % cuBLAS |
+|---|---|---|---|---|---|---|---|
+| 128 | 128 | 32 | 8 | 4 | 512 | 3325 | 93.5% |
+| 128 | 128 | 16 | 8 | 4 | 512 | 3245 | 93.1% |
+| 128 | 128 | 16 | 8 | 8 | 256 | 3201 | 90.9% |
+| 128 | 128 | 8 | 8 | 8 | 256 | 3179 | 92.2% |
+| 128 | 128 | 32 | 8 | 8 | 256 | 3137 | 88.2% |
+
+35 valid configurations were measured at size 4096.
 <!-- END:autotune_best -->
 
 ![autotune heatmap](plots/autotune_heatmap.png)
 
 <!-- BEGIN:k7_result -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+**Measured at 4096:** 3380 GFLOPS, 78.7% of cuBLAS, 1.00x over K6 (median of 20 runs, 40.67 ms).
 <!-- END:k7_result -->
 
 **The trade-off.** Bigger tiles mean more reuse. A BMxBN block tile loads (BM+BN)xBK floats per K-step to do BMxBNxBK FMAs, and a TMxTN thread tile does TMxTN FMAs per TM+TN shared loads. But both cost resources:
@@ -322,7 +350,52 @@ _Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python script
 There is no closed-form winner, which is why it's measured. Registers per thread for each kernel come from `nvcc -Xptxas -v` (written by `scripts/profile.sh` to `results/resource_usage.txt`):
 
 <!-- BEGIN:resource_table -->
-_Not measured yet: run `bash scripts/profile.sh` on the GPU, then `python scripts/update_readme.py`._
+From `ptxas resource usage, arch=sm_75 (Build cuda_13.0.r13.0/compiler.36424714_0)`:
+
+|  | kernel | registers / thread | static smem (bytes) | spill stores (bytes) |
+|---|---|---|---|---|
+| K1 | sgemm_naive | 52 | 0 | 0 |
+| K2 | sgemm_coalesced | 53 | 0 | 0 |
+| K3 | sgemm_shared_mem | 41 | 8192 | 0 |
+| K4 | sgemm_1d_blocktiling | 64 | 4096 | 0 |
+| K5 | sgemm_2d_blocktiling | 119 | 8192 | 0 |
+| K6 | sgemm_vectorized | 101 | 8192 | 0 |
+| K7 | autotuned<128,128,32,4,4> | 58 | 32768 | 0 |
+| K7 | autotuned<128,64,32,4,4> | 58 | 24576 | 0 |
+| K7 | autotuned<64,64,16,4,4> | 60 | 8192 | 0 |
+| K7 | autotuned<64,128,32,4,4> | 62 | 24576 | 0 |
+| K7 | autotuned<64,64,32,4,4> | 62 | 16384 | 0 |
+| K7 | autotuned<128,128,32,8,4> | 64 | 32768 | 0 |
+| K7 | autotuned<64,64,16,4,8> | 64 | 8192 | 0 |
+| K7 | autotuned<64,64,8,8,4> | 64 | 4096 | 0 |
+| K7 | autotuned<128,128,32,4,8> | 65 | 32768 | 0 |
+| K7 | autotuned<128,128,16,8,4> | 65 | 16384 | 0 |
+| K7 | autotuned<128,64,16,8,4> | 65 | 12288 | 0 |
+| K7 | autotuned<64,128,16,8,4> | 65 | 12288 | 0 |
+| K7 | autotuned<64,64,16,8,4> | 65 | 8192 | 0 |
+| K7 | autotuned<64,64,8,4,8> | 65 | 4096 | 0 |
+| K7 | autotuned<128,128,16,4,8> | 66 | 16384 | 0 |
+| K7 | autotuned<128,64,16,4,8> | 67 | 12288 | 0 |
+| K7 | autotuned<64,128,16,4,8> | 67 | 12288 | 0 |
+| K7 | autotuned<64,128,32,4,8> | 72 | 24576 | 0 |
+| K7 | autotuned<128,64,32,8,4> | 73 | 24576 | 0 |
+| K7 | autotuned<128,64,32,4,8> | 73 | 24576 | 0 |
+| K7 | autotuned<64,64,32,4,8> | 74 | 16384 | 0 |
+| K7 | autotuned<64,128,32,8,4> | 77 | 24576 | 0 |
+| K7 | autotuned<64,64,32,8,4> | 77 | 16384 | 0 |
+| K7 | autotuned<128,64,8,8,8> | 99 | 6144 | 0 |
+| K7 | autotuned<64,128,16,8,8> | 100 | 12288 | 0 |
+| K7 | autotuned<128,128,16,8,8> | 101 | 16384 | 0 |
+| K7 | autotuned<128,128,8,8,8> | 101 | 8192 | 0 |
+| K7 | autotuned<128,64,16,8,8> | 101 | 12288 | 0 |
+| K7 | autotuned<64,128,8,8,8> | 101 | 6144 | 0 |
+| K7 | autotuned<64,64,8,8,8> | 103 | 4096 | 0 |
+| K7 | autotuned<128,128,32,8,8> | 105 | 32768 | 0 |
+| K7 | autotuned<64,64,16,8,8> | 106 | 8192 | 0 |
+| K7 | autotuned<64,128,32,8,8> | 121 | 24576 | 0 |
+| K7 | autotuned<128,64,32,8,8> | 122 | 24576 | 0 |
+| K7 | autotuned<64,64,32,8,8> | 138 | 16384 | 0 |
+| K8 | sgemm_wmma_fp16 | 72 | 0 | 0 |
 <!-- END:resource_table -->
 
 ### K8 (stretch): tensor cores with WMMA
@@ -344,7 +417,14 @@ for (int k = 0; k < K; k += 16) {
 Which thread holds which element of a fragment is unspecified, so everything goes through the warp-wide `*_sync` calls. The epilogue applies alpha/beta element-wise, which is valid because the accumulator fragment and the loaded C fragment share the same layout.
 
 <!-- BEGIN:fp16_table -->
-_Not measured yet: run `bash scripts/run_all.sh` on the GPU, then `python scripts/update_readme.py`._
+| size | cublasGemmEx FP16->FP32 GFLOPS | K8 WMMA GFLOPS | % of cublasGemmEx | max abs error |
+|---|---|---|---|---|
+| 128 | 290 | 262 | 90.2% | 0.0e+00 |
+| 256 | 1478 | 1364 | 92.3% | 1.9e-05 |
+| 512 | 12548 | 5072 | 40.4% | 3.8e-05 |
+| 1024 | 30869 | 6636 | 21.5% | 0.0e+00 |
+| 2048 | 40528 | 4927 | 12.2% | 0.0e+00 |
+| 4096 | 19685 | 4258 | 21.6% | 0.0e+00 |
 <!-- END:fp16_table -->
 
 The obvious next steps are staging A/B tiles in shared memory, so each fragment load isn't a strided global read, and giving each warp a larger tile.
@@ -356,13 +436,35 @@ The obvious next steps are staging A/B tiles in shared memory, so each fragment 
 `scripts/profile.sh` profiles one steady-state launch of each kernel at 4096 with Nsight Compute. It skips the correctness launch and warm-ups with `--launch-skip 4 --launch-count 1`. On Colab, `ncu` can fail with `ERR_NVGPUCTRPERM` because the VM doesn't expose performance counters. The script then prints instructions for a rented Linux GPU, where `sudo ncu` works, and still writes the `ptxas` resource report.
 
 <!-- BEGIN:ncu_table -->
-_Not measured yet: run `bash scripts/profile.sh` on the GPU, then `python scripts/update_readme.py`._
+| Kernel | time (ms) | DRAM read (MB) | DRAM write (MB) | SM % | DRAM % | achieved occupancy % | smem ld bank conflicts | smem st bank conflicts |
+|---|---|---|---|---|---|---|---|---|
+| cuBLAS (reference) | 47.49 | 2148 | 85 | 96.7 | 14.7 | 48.9 | 126447 | 3763024 |
+| K1 naive | 6066.37 | 17764 | 86 | 6.0 | 0.9 | 98.1 | 0 | 0 |
+| K2 global memory coalescing | 423.01 | 17646 | 85 | 86.8 | 13.1 | 98.3 | 0 | 0 |
+| K3 shared memory tiling | 331.85 | 13178 | 85 | 76.1 | 12.5 | 100.0 | 0 | 0 |
+| K4 1D block tiling | 141.12 | 6505 | 84 | 57.0 | 14.6 | 99.6 | 0 | 0 |
+| K5 2D block tiling | 76.34 | 3016 | 83 | 61.1 | 12.7 | 49.3 | 301989888 | 0 |
+| K6 vectorized + transposed A | 70.81 | 2256 | 81 | 65.1 | 10.3 | 49.3 | 268435456 | 16777216 |
+| K7 autotuned | 70.81 | 2257 | 81 | 65.1 | 10.3 | 49.3 | 268435456 | 16777216 |
+
+(ncu locks clocks to base frequency, so its times are longer than the harness timings.)
 <!-- END:ncu_table -->
 
 Top warp stall reasons:
 
 <!-- BEGIN:stall_table -->
-_Not measured yet: run `bash scripts/profile.sh` on the GPU, then `python scripts/update_readme.py`._
+| Kernel | Top stall reason | 2nd | 3rd |
+|---|---|---|---|
+| cuBLAS (reference) | not_selected (2.18) | math_pipe_throttle (2.17) | selected (1.00) |
+| K1 naive | lg_throttle (436.70) | long_scoreboard (4.28) | not_selected (2.93) |
+| K2 global memory coalescing | lg_throttle (23.76) | not_selected (3.12) | wait (2.44) |
+| K3 shared memory tiling | mio_throttle (28.27) | long_scoreboard (5.30) | not_selected (3.43) |
+| K4 1D block tiling | mio_throttle (15.37) | long_scoreboard (3.48) | barrier (3.27) |
+| K5 2D block tiling | mio_throttle (3.76) | not_selected (1.18) | wait (1.03) |
+| K6 vectorized + transposed A | mio_throttle (3.07) | short_scoreboard (1.26) | not_selected (1.05) |
+| K7 autotuned | mio_throttle (3.07) | short_scoreboard (1.26) | not_selected (1.05) |
+
+(cycles stalled per issued instruction, from the WarpStateStats section)
 <!-- END:stall_table -->
 
 How to read the stall reasons. **long_scoreboard** is a warp waiting on a global/local memory load, typical of K1-K2. **mio_throttle / short_scoreboard** is a warp waiting on shared memory, the K3 signature. **math_pipe_throttle / not_selected** means the FMA pipe is busy, which is what you want to see in K5-K7. **barrier** is time spent in `__syncthreads()`.
@@ -389,7 +491,11 @@ What to expect and look for:
 **Small thread tiles (TM=TN=4).** The intuition "more threads = more parallelism" suggested that 128x128 tiles with 4x4 per thread (1024 threads) should beat 8x8 per thread (256 threads). It shouldn't, and the sweep checks it. A 4x4 outer product does 16 FMAs for 8 shared loads (2 FMA/load), versus 64 for 16 (4 FMA/load) at 8x8. That halves the compute-to-load ratio, which was the whole point of K5. More threads also means more threads repeating the same address math and the same `__syncthreads()`. The bottom of the autotune sweep:
 
 <!-- BEGIN:autotune_worst -->
-_Not measured yet: run `bash scripts/autotune.sh` on the GPU, then `python scripts/update_readme.py`._
+| BM | BN | BK | TM | TN | threads | GFLOPS | % cuBLAS |
+|---|---|---|---|---|---|---|---|
+| 64 | 64 | 32 | 4 | 8 | 128 | 1948 | 53.7% |
+| 64 | 64 | 16 | 4 | 8 | 128 | 2020 | 55.0% |
+| 64 | 64 | 8 | 4 | 8 | 128 | 2024 | 53.6% |
 <!-- END:autotune_worst -->
 
 **Expecting K3 to be a big win.** Shared memory is "the" textbook optimization, but at one output per thread it only moves the bottleneck from DRAM to the shared-memory pipe (2 loads per FMA). The real gains only came once each thread computed many outputs from registers (K4, K5).
